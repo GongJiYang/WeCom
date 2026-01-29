@@ -80,9 +80,19 @@ function verifyWeComSignature(params: {
   return result === 0;
 }
 
+// 获取 logger 实例（在 handleWeComWebhookRequest 中初始化）
+let wecomLogger: ReturnType<WeComCoreRuntime["logging"]["getChildLogger"]> | null = null;
+
+function getWeComLogger(core: WeComCoreRuntime): ReturnType<WeComCoreRuntime["logging"]["getChildLogger"]> {
+  if (!wecomLogger) {
+    wecomLogger = core.logging.getChildLogger({ subsystem: "gateway/channels/wecom" });
+  }
+  return wecomLogger;
+}
+
 function logVerbose(core: WeComCoreRuntime, runtime: WeComRuntimeEnv, message: string): void {
   if (core.logging.shouldLogVerbose()) {
-    runtime.log?.(`[wecom] ${message}`);
+    getWeComLogger(core).debug?.(`[wecom] ${message}`);
   }
 }
 
@@ -104,6 +114,7 @@ function decryptWeComMessage(
   encryptedMsg: string,
   encodingAESKey: string,
   corpId?: string,
+  logger?: { error: (msg: string) => void; debug?: (msg: string) => void },
 ): string | null {
   try {
     // 1. Base64 解码 encodingAESKey（43 位 -> 32 字节）
@@ -114,6 +125,7 @@ function decryptWeComMessage(
     }
     const aesKey = Buffer.from(aesKeyBase64, "base64");
     if (aesKey.length !== 32) {
+      logger?.error(`WeCom decrypt: invalid encodingAESKey length (decoded: ${aesKey.length} bytes, expected: 32)`);
       return null;
     }
 
@@ -123,16 +135,25 @@ function decryptWeComMessage(
     // 3. Base64 解码加密消息
     const encrypted = Buffer.from(encryptedMsg, "base64");
     if (encrypted.length === 0) {
+      logger?.error("WeCom decrypt: empty encrypted message");
       return null;
     }
+    logger?.debug?.(`WeCom decrypt: encrypted message length: ${encrypted.length} bytes`);
 
     // 4. AES-256-CBC 解密
     const decipher = crypto.createDecipheriv("aes-256-cbc", aesKey, iv);
     decipher.setAutoPadding(true);
-    const decrypted = Buffer.concat([decipher.update(encrypted), decipher.final()]);
+    let decrypted: Buffer;
+    try {
+      decrypted = Buffer.concat([decipher.update(encrypted), decipher.final()]);
+    } catch (decryptErr) {
+      logger?.error(`WeCom decrypt: AES decryption failed: ${decryptErr instanceof Error ? decryptErr.message : String(decryptErr)}`);
+      return null;
+    }
 
     // 5. 解析解密后的数据格式：random(16字节) + msg_len(4字节网络字节序) + msg + receiveid
     if (decrypted.length < 20) {
+      logger?.error(`WeCom decrypt: decrypted message too short (${decrypted.length} bytes, minimum: 20)`);
       return null;
     }
 
@@ -142,6 +163,7 @@ function decryptWeComMessage(
 
     // 验证消息长度
     if (msgLen < 0 || msgLen > decrypted.length - 20) {
+      logger?.error(`WeCom decrypt: invalid message length (${msgLen}, available: ${decrypted.length - 20})`);
       return null;
     }
 
@@ -150,15 +172,17 @@ function decryptWeComMessage(
 
     // 提取 receiveid（剩余部分）
     const receiveid = decrypted.subarray(20 + msgLen).toString("utf8");
+    logger?.debug?.(`WeCom decrypt: receiveid=${receiveid}, msgLen=${msgLen}`);
 
     // 如果提供了 corpId，验证 receiveid 是否匹配（企业微信中 receiveid 通常是 $CorpID）
     if (corpId && receiveid && receiveid !== corpId && receiveid !== `$${corpId}`) {
-      // 允许 receiveid 是 $CorpID 格式
+      logger?.error(`WeCom decrypt: receiveid mismatch (received: ${receiveid}, expected: ${corpId} or $${corpId})`);
       return null;
     }
 
     return msg;
   } catch (err) {
+    logger?.error(`WeCom decrypt: unexpected error: ${err instanceof Error ? err.message : String(err)}`);
     return null;
   }
 }
@@ -536,11 +560,11 @@ export async function handleWeComWebhookRequest(
   
   // 调试日志：记录所有请求（包括路径不匹配的情况）
   const runtime = getWeComRuntime();
-  runtime.log?.(`[wecom] HTTP handler called: method=${req.method}, path=${path}, url.pathname=${url.pathname}`);
+  getWeComLogger(runtime).info(`[wecom] HTTP handler called: method=${req.method}, path=${path}, url.pathname=${url.pathname}`);
   
   // 检查路径是否匹配 wecom webhook 路径
   if (!path.startsWith("/webhook/wecom/")) {
-    runtime.log?.(`[wecom] Path ${path} does not match wecom webhook pattern, returning false`);
+    getWeComLogger(runtime).debug?.(`[wecom] Path ${path} does not match wecom webhook pattern, returning false`);
     return false;
   }
 
@@ -595,9 +619,10 @@ export async function handleWeComWebhookRequest(
       }
     }
 
-    // 如果配置了 encodingAESKey，需要解密 echostr
+      // 如果配置了 encodingAESKey，需要解密 echostr
     if (account?.encodingAESKey) {
-      const decryptedEchostr = decryptWeComMessage(echostr, account.encodingAESKey, account.corpId);
+      const logger = getWeComRuntime().logging.getChildLogger({ subsystem: "gateway/channels/wecom" });
+      const decryptedEchostr = decryptWeComMessage(echostr, account.encodingAESKey, account.corpId, logger);
       if (!decryptedEchostr) {
         // 解密失败，返回错误
         res.statusCode = 400;
@@ -620,9 +645,9 @@ export async function handleWeComWebhookRequest(
 
   // POST 请求需要已注册的 targets
   const targets = webhookTargets.get(path);
-  runtime.log?.(`[wecom] Looking for targets for path: ${path}, found: ${targets?.length ?? 0}`);
+  getWeComLogger(runtime).debug?.(`[wecom] Looking for targets for path: ${path}, found: ${targets?.length ?? 0}`);
   if (!targets || targets.length === 0) {
-    runtime.log?.(`[wecom] No targets found for path: ${path}, registered paths: ${Array.from(webhookTargets.keys()).join(", ")}`);
+    getWeComLogger(runtime).warn(`[wecom] No targets found for path: ${path}, registered paths: ${Array.from(webhookTargets.keys()).join(", ")}`);
     return false;
   }
 
@@ -636,21 +661,8 @@ export async function handleWeComWebhookRequest(
   // POST 请求需要已注册的 targets（account 必须已启动）
   if (!targets || targets.length === 0) return false;
 
-  // 验证 token（如果配置了）
-  const tokenParam = url.searchParams.get("token");
-  const target = targets.find((entry) => {
-    if (!entry.account.webhookToken) return true; // 如果没有配置 token，允许所有
-    return entry.account.webhookToken === tokenParam;
-  });
-
-  if (!target && tokenParam) {
-    runtime.log?.(`[wecom] Token mismatch: received=${tokenParam}, expected=${targets[0]?.account.webhookToken || "none"}`);
-    res.statusCode = 401;
-    res.end("unauthorized");
-    return true;
-  }
-
-  const selectedTarget = target ?? targets[0];
+  // 选择 target（企业微信 webhook 使用签名验证，不使用 URL 参数 token）
+  const selectedTarget = targets[0];
 
   // 读取请求体（用于签名验证和解析，支持 JSON 和 XML）
   const bodyResult = await readRequestBody(req, 1024 * 1024);
@@ -705,7 +717,7 @@ export async function handleWeComWebhookRequest(
     });
 
     if (!isValid) {
-      logVerbose(selectedTarget.core, selectedTarget.runtime, "WeCom webhook signature verification failed");
+      getWeComLogger(runtime).warn("WeCom webhook signature verification failed");
       res.statusCode = 401;
       res.end("unauthorized");
       return true;
@@ -725,14 +737,23 @@ export async function handleWeComWebhookRequest(
     }
   }
 
-  if (selectedTarget.account.encodingAESKey && encryptedValue) {
+  if (selectedTarget.account.encodingAESKey) {
+    if (!encryptedValue) {
+      getWeComLogger(runtime).warn("WeCom: encodingAESKey configured but no Encrypt field found in message");
+      res.statusCode = 400;
+      res.end("encrypted message required");
+      return true;
+    }
+    
+    const logger = getWeComLogger(runtime);
     const decryptedMsg = decryptWeComMessage(
       encryptedValue,
       selectedTarget.account.encodingAESKey,
       selectedTarget.account.corpId,
+      logger,
     );
     if (!decryptedMsg) {
-      logVerbose(selectedTarget.core, selectedTarget.runtime, "WeCom message decryption failed");
+      logger.error("WeCom message decryption failed (check logs above for details)");
       res.statusCode = 400;
       res.end("decrypt failed");
       return true;
@@ -746,7 +767,7 @@ export async function handleWeComWebhookRequest(
         if (xmlPayload) {
           payload = xmlPayload;
         } else {
-          logVerbose(selectedTarget.core, selectedTarget.runtime, "WeCom XML parse failed after decryption");
+          getWeComLogger(runtime).error("WeCom XML parse failed after decryption");
           res.statusCode = 400;
           res.end("xml parse failed");
           return true;
@@ -758,7 +779,7 @@ export async function handleWeComWebhookRequest(
       }
     } catch (err) {
       // 如果解析失败，记录日志并返回错误
-      logVerbose(selectedTarget.core, selectedTarget.runtime, `WeCom decrypted message parse failed: ${String(err)}`);
+      getWeComLogger(runtime).error(`WeCom decrypted message parse failed: ${String(err)}`);
       res.statusCode = 400;
       res.end("parse failed");
       return true;
@@ -770,7 +791,7 @@ export async function handleWeComWebhookRequest(
   
   // 解析企业微信消息
   const msgType = typeof payload.MsgType === "string" ? payload.MsgType : "";
-  runtime.log?.(`[wecom] Processing message: msgType=${msgType}, FromUserName=${payload.FromUserName}, Content=${typeof payload.Content === "string" ? payload.Content.substring(0, 50) : "N/A"}`);
+  getWeComLogger(runtime).info(`[wecom] Processing message: msgType=${msgType}, FromUserName=${payload.FromUserName}, Content=${typeof payload.Content === "string" ? payload.Content.substring(0, 50) : "N/A"}`);
   
   if (msgType === "text") {
     processWeComMessage({
@@ -782,11 +803,7 @@ export async function handleWeComWebhookRequest(
       );
     });
   } else {
-    logVerbose(
-      selectedTarget.core,
-      selectedTarget.runtime,
-      `webhook received unsupported msgType: ${msgType}`,
-    );
+    getWeComLogger(runtime).info(`[wecom] webhook received unsupported msgType: ${msgType}`);
   }
 
   res.statusCode = 200;
@@ -839,7 +856,7 @@ export async function monitorWeComProvider(
 
   abortSignal.addEventListener("abort", stop);
 
-  runtime.log?.(`[wecom:${account.accountId}] Webhook path registered: ${normalizedPath}`);
+  getWeComLogger(core).info(`[wecom:${account.accountId}] Webhook path registered: ${normalizedPath}`);
 
   return { stop };
 }
