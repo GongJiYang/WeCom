@@ -1,0 +1,14 @@
+{
+  "extends": "../../tsconfig.json",
+  "compilerOptions": {
+    "moduleResolution": "NodeNext",
+    "rootDir": ".",
+    "typeRoots": ["../../src/types", "../../node_modules/@types"]
+  },
+  "files": [
+    "../../src/types/lydell-node-pty.d.ts",
+    "../../src/types/qrcode-terminal.d.ts"
+  ],
+  "include": ["./index.ts", "./src/**/*.ts"],
+  "exclude": ["../../src/**", "../../apps/**", "../../ui/**"]
+}
