@@ -534,9 +534,15 @@ export async function handleWeComWebhookRequest(
   const url = new URL(req.url ?? "/", "http://localhost");
   const path = normalizeWebhookPath(url.pathname);
   
-  // 调试日志：记录所有请求
+  // 调试日志：记录所有请求（包括路径不匹配的情况）
   const runtime = getWeComRuntime();
-  runtime.log?.(`[wecom] Received ${req.method} request to ${path}`);
+  runtime.log?.(`[wecom] HTTP handler called: method=${req.method}, path=${path}, url.pathname=${url.pathname}`);
+  
+  // 检查路径是否匹配 wecom webhook 路径
+  if (!path.startsWith("/webhook/wecom/")) {
+    runtime.log?.(`[wecom] Path ${path} does not match wecom webhook pattern, returning false`);
+    return false;
+  }
 
   // 企业微信 webhook 验证（GET 请求用于验证，POST 用于接收消息）
   if (req.method === "GET") {
@@ -614,8 +620,9 @@ export async function handleWeComWebhookRequest(
 
   // POST 请求需要已注册的 targets
   const targets = webhookTargets.get(path);
+  runtime.log?.(`[wecom] Looking for targets for path: ${path}, found: ${targets?.length ?? 0}`);
   if (!targets || targets.length === 0) {
-    runtime.log?.(`[wecom] No targets found for path: ${path}`);
+    runtime.log?.(`[wecom] No targets found for path: ${path}, registered paths: ${Array.from(webhookTargets.keys()).join(", ")}`);
     return false;
   }
 
