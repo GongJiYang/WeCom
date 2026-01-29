@@ -388,9 +388,16 @@ export const wecomPlugin: ChannelPlugin<ResolvedWeComAccount> = {
         if (name) wecomAgentLabel = ` (${name})`;
         ctx.setStatus({
           accountId: account.accountId,
+          running: true,
+          lastStartAt: Date.now(),
         });
       } catch {
-        // ignore probe errors
+        // ignore probe errors, but still mark as running
+        ctx.setStatus({
+          accountId: account.accountId,
+          running: true,
+          lastStartAt: Date.now(),
+        });
       }
 
       ctx.log?.info(`[${account.accountId}] starting provider${wecomAgentLabel}`);
