@@ -533,6 +533,10 @@ export async function handleWeComWebhookRequest(
 ): Promise<boolean> {
   const url = new URL(req.url ?? "/", "http://localhost");
   const path = normalizeWebhookPath(url.pathname);
+  
+  // 调试日志：记录所有请求
+  const runtime = getWeComRuntime();
+  runtime.log?.(`[wecom] Received ${req.method} request to ${path}`);
 
   // 企业微信 webhook 验证（GET 请求用于验证，POST 用于接收消息）
   if (req.method === "GET") {
@@ -610,7 +614,10 @@ export async function handleWeComWebhookRequest(
 
   // POST 请求需要已注册的 targets
   const targets = webhookTargets.get(path);
-  if (!targets || targets.length === 0) return false;
+  if (!targets || targets.length === 0) {
+    runtime.log?.(`[wecom] No targets found for path: ${path}`);
+    return false;
+  }
 
   if (req.method !== "POST") {
     res.statusCode = 405;
@@ -630,6 +637,7 @@ export async function handleWeComWebhookRequest(
   });
 
   if (!target && tokenParam) {
+    runtime.log?.(`[wecom] Token mismatch: received=${tokenParam}, expected=${targets[0]?.account.webhookToken || "none"}`);
     res.statusCode = 401;
     res.end("unauthorized");
     return true;
@@ -755,6 +763,8 @@ export async function handleWeComWebhookRequest(
   
   // 解析企业微信消息
   const msgType = typeof payload.MsgType === "string" ? payload.MsgType : "";
+  runtime.log?.(`[wecom] Processing message: msgType=${msgType}, FromUserName=${payload.FromUserName}, Content=${typeof payload.Content === "string" ? payload.Content.substring(0, 50) : "N/A"}`);
+  
   if (msgType === "text") {
     processWeComMessage({
       payload,
