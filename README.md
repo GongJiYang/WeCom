@@ -1,5 +1,7 @@
 # 企业微信 (WeCom) 通道插件
 
+> 本仓库完全由 AI 编写。
+
 Clawdbot 的企业微信通道插件，通过企业微信应用接收与发送消息，与 Agent 对话。
 
 ## 功能概览
@@ -223,7 +225,3 @@ clawdbot channels status --deep
 - [企业微信 - 接收消息](https://developer.work.weixin.qq.com/document/path/90239)
 - [企业微信 - 发送应用消息](https://developer.work.weixin.qq.com/document/path/90236)
 - [企业微信 - 消息加解密](https://developer.work.weixin.qq.com/document/path/101033)
-
----
-
-本仓库由 AI 辅助编写。
