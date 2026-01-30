@@ -14,8 +14,11 @@ function decryptWeComMessage(
   corpId?: string,
 ): string | null {
   try {
+    // 与 monitor.ts 一致：去掉首尾及中间空白；密文里空格先还原为 +（应对表单解码）
+    const rawKey = encodingAESKey.trim().replace(/\s/g, "");
+    let rawEnc = encryptedMsg.trim().replace(/ /g, "+").replace(/[\n\r\t]/g, "");
     // 1. Base64 解码 encodingAESKey（43 位 -> 32 字节）
-    let aesKeyBase64 = encodingAESKey;
+    let aesKeyBase64 = rawKey;
     if (aesKeyBase64.length === 43) {
       aesKeyBase64 += "=";
     }
@@ -28,15 +31,19 @@ function decryptWeComMessage(
     const iv = aesKey.subarray(0, 16);
 
     // 3. Base64 解码加密消息
-    const encrypted = Buffer.from(encryptedMsg, "base64");
+    const encrypted = Buffer.from(rawEnc, "base64");
     if (encrypted.length === 0) {
       return null;
     }
 
-    // 4. AES-256-CBC 解密
+    // 4. AES-256-CBC 解密（OpenSSL 3 对 PKCS#7 校验过严，关闭自动去 padding 后手动去除）
     const decipher = crypto.createDecipheriv("aes-256-cbc", aesKey, iv);
-    decipher.setAutoPadding(true);
-    const decrypted = Buffer.concat([decipher.update(encrypted), decipher.final()]);
+    decipher.setAutoPadding(false);
+    let decrypted = Buffer.concat([decipher.update(encrypted), decipher.final()]);
+    const padLen = decrypted[decrypted.length - 1];
+    if (padLen >= 1 && padLen <= 16 && decrypted.length >= padLen) {
+      decrypted = decrypted.subarray(0, decrypted.length - padLen);
+    }
 
     // 5. 解析解密后的数据格式：random(16字节) + msg_len(4字节网络字节序) + msg + receiveid
     if (decrypted.length < 20) {
@@ -55,8 +62,9 @@ function decryptWeComMessage(
     // 提取 msg
     const msg = decrypted.subarray(20, 20 + msgLen).toString("utf8");
 
-    // 提取 receiveid（剩余部分）
-    const receiveid = decrypted.subarray(20 + msgLen).toString("utf8");
+    // 提取 receiveid（剩余部分），去掉尾部控制字符
+    const receiveidRaw = decrypted.subarray(20 + msgLen).toString("utf8");
+    const receiveid = receiveidRaw.replace(/[\u0000-\u001f]+$/g, "").trim();
 
     // 如果提供了 corpId，验证 receiveid 是否匹配
     if (corpId && receiveid && receiveid !== corpId && receiveid !== `$${corpId}`) {

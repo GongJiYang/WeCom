@@ -117,37 +117,55 @@ function decryptWeComMessage(
   logger?: { error: (msg: string) => void; debug?: (msg: string) => void },
 ): string | null {
   try {
+    // 去除首尾及中间空白（复制粘贴时可能带空格），避免 bad decrypt
+    const rawKey = encodingAESKey.trim().replace(/\s/g, "");
+    // 密文：若请求体被按 application/x-www-form-urlencoded 解析，Base64 里的 + 会变成空格，先还原再去掉换行
+    let rawEnc = encryptedMsg.trim().replace(/ /g, "+").replace(/[\n\r\t]/g, "");
     // 1. Base64 解码 encodingAESKey（43 位 -> 32 字节）
     // 注意：43 位 Base64 字符串需要补一个 '=' 才能正确解码
-    let aesKeyBase64 = encodingAESKey;
+    if (rawKey.length !== 43) {
+      logger?.error(`WeCom decrypt: encodingAESKey length after trim is ${rawKey.length} (expected 43). Check for extra/missing chars or spaces in config.`);
+    }
+    logger?.debug?.(`WeCom decrypt: encodingAESKey length: ${rawKey.length} chars, first 10 chars: ${rawKey.substring(0, 10)}...`);
+    let aesKeyBase64 = rawKey;
     if (aesKeyBase64.length === 43) {
       aesKeyBase64 += "=";
     }
     const aesKey = Buffer.from(aesKeyBase64, "base64");
     if (aesKey.length !== 32) {
-      logger?.error(`WeCom decrypt: invalid encodingAESKey length (decoded: ${aesKey.length} bytes, expected: 32)`);
+      logger?.error(`WeCom decrypt: invalid encodingAESKey length (decoded: ${aesKey.length} bytes, expected: 32, input length: ${rawKey.length})`);
       return null;
     }
+    logger?.debug?.(`WeCom decrypt: AES key decoded successfully (32 bytes)`);
 
     // 2. IV 是 encodingAESKey 的前 16 字节
     const iv = aesKey.subarray(0, 16);
 
     // 3. Base64 解码加密消息
-    const encrypted = Buffer.from(encryptedMsg, "base64");
+    logger?.debug?.(`WeCom decrypt: encryptedMsg length: ${rawEnc.length} chars, first 20 chars: ${rawEnc.substring(0, 20)}...`);
+    const encrypted = Buffer.from(rawEnc, "base64");
     if (encrypted.length === 0) {
       logger?.error("WeCom decrypt: empty encrypted message");
       return null;
     }
-    logger?.debug?.(`WeCom decrypt: encrypted message length: ${encrypted.length} bytes`);
+    logger?.debug?.(`WeCom decrypt: encrypted message length: ${encrypted.length} bytes (after base64 decode)`);
 
-    // 4. AES-256-CBC 解密
+    // 4. AES-256-CBC 解密（OpenSSL 3 对 PKCS#7 校验过严，关闭自动去 padding 后手动去除）
     const decipher = crypto.createDecipheriv("aes-256-cbc", aesKey, iv);
-    decipher.setAutoPadding(true);
+    decipher.setAutoPadding(false);
     let decrypted: Buffer;
     try {
       decrypted = Buffer.concat([decipher.update(encrypted), decipher.final()]);
+      const padLen = decrypted[decrypted.length - 1];
+      if (padLen >= 1 && padLen <= 16 && decrypted.length >= padLen) {
+        decrypted = decrypted.subarray(0, decrypted.length - padLen);
+      }
     } catch (decryptErr) {
-      logger?.error(`WeCom decrypt: AES decryption failed: ${decryptErr instanceof Error ? decryptErr.message : String(decryptErr)}`);
+      const msg = decryptErr instanceof Error ? decryptErr.message : String(decryptErr);
+      logger?.error(`WeCom decrypt: AES decryption failed: ${msg}`);
+      if (msg.includes("bad decrypt") || msg.includes("BAD_DECRYPT")) {
+        logger?.error("WeCom decrypt: hint: ensure encodingAESKey in config exactly matches EncodingAESKey in WeCom console (43 chars, no spaces).");
+      }
       return null;
     }
 
@@ -170,11 +188,12 @@ function decryptWeComMessage(
     // 提取 msg
     const msg = decrypted.subarray(20, 20 + msgLen).toString("utf8");
 
-    // 提取 receiveid（剩余部分）
-    const receiveid = decrypted.subarray(20 + msgLen).toString("utf8");
+    // 提取 receiveid（剩余部分），去掉尾部控制字符（企业微信有时会带 0x1e 等）
+    const receiveidRaw = decrypted.subarray(20 + msgLen).toString("utf8");
+    const receiveid = receiveidRaw.replace(/[\u0000-\u001f]+$/g, "").trim();
     logger?.debug?.(`WeCom decrypt: receiveid=${receiveid}, msgLen=${msgLen}`);
 
-    // 如果提供了 corpId，验证 receiveid 是否匹配（企业微信中 receiveid 通常是 $CorpID）
+    // 如果提供了 corpId，验证 receiveid 是否匹配（企业微信中 receiveid 通常是 corpId 或 $corpId）
     if (corpId && receiveid && receiveid !== corpId && receiveid !== `$${corpId}`) {
       logger?.error(`WeCom decrypt: receiveid mismatch (received: ${receiveid}, expected: ${corpId} or $${corpId})`);
       return null;
@@ -243,8 +262,8 @@ function parseWeComXML(xml: string): Record<string, unknown> | null {
   try {
     const result: Record<string, unknown> = {};
     // 简单的 XML 解析（使用正则表达式提取标签内容）
-    // 匹配 <TagName><![CDATA[value]]></TagName> 或 <TagName>value</TagName>
-    const tagRegex = /<(\w+)><!\[CDATA\[(.*?)\]\]><\/\1>|<(\w+)>(.*?)<\/\3>/g;
+    // 匹配 <TagName><![CDATA[value]]></TagName> 或 <TagName>value</TagName>（value 可含换行，用 [\s\S]*?）
+    const tagRegex = /<(\w+)><!\[CDATA\[([\s\S]*?)\]\]><\/\1>|<(\w+)>([\s\S]*?)<\/\3>/g;
     let match;
     while ((match = tagRegex.exec(xml)) !== null) {
       const tagName = match[1] || match[3];
@@ -683,36 +702,40 @@ export async function handleWeComWebhookRequest(
     }
   }
 
+  // 统一提取 Encrypt 字段（用于签名验证和解密）
+  let encryptedValue: string | undefined;
+  if (typeof payload.Encrypt === "string") {
+    encryptedValue = payload.Encrypt;
+  } else if (rawBody && rawBody.trim().startsWith("<")) {
+    // XML 格式，从原始 XML 中提取 Encrypt 标签（内容可能含换行，用 [\s\S]*?）
+    const encryptMatch = rawBody.match(/<Encrypt><!\[CDATA\[([\s\S]*?)\]\]><\/Encrypt>|<Encrypt>([\s\S]*?)<\/Encrypt>/);
+    if (encryptMatch) {
+      encryptedValue = (encryptMatch[1] ?? encryptMatch[2] ?? "").trim();
+      if (!encryptedValue) encryptedValue = undefined;
+    }
+  }
+  
+  getWeComLogger(runtime).debug?.(`WeCom: extracted Encrypt field: ${encryptedValue ? `length=${encryptedValue.length}, first 20 chars=${encryptedValue.substring(0, 20)}...` : "NOT_FOUND"}`);
+
   // 验证签名（如果配置了 webhookToken）
   const msgSignature = url.searchParams.get("msg_signature");
   const timestamp = url.searchParams.get("timestamp");
   const nonce = url.searchParams.get("nonce");
 
   if (selectedTarget.account.webhookToken && msgSignature && timestamp && nonce) {
-    // 企业微信 POST 请求可能是 XML 格式，需要提取 Encrypt 字段
-    // 如果是 JSON 格式，直接使用整个 body 的字符串形式
-    let encryptedMsg = "";
-    if (typeof payload.Encrypt === "string") {
-      encryptedMsg = payload.Encrypt;
-    } else if (rawBody && rawBody.trim().startsWith("<")) {
-      // XML 格式，从原始 XML 中提取 Encrypt 标签
-      const encryptMatch = rawBody.match(/<Encrypt><!\[CDATA\[(.*?)\]\]><\/Encrypt>|<Encrypt>(.*?)<\/Encrypt>/);
-      if (encryptMatch) {
-        encryptedMsg = encryptMatch[1] || encryptMatch[2] || "";
-      } else {
-        // 如果没有 Encrypt 字段，使用整个 body 的字符串形式
-        encryptedMsg = rawBody;
-      }
-    } else {
-      // 如果没有 Encrypt 字段，使用整个 payload 的 JSON 字符串
-      encryptedMsg = JSON.stringify(payload);
+    // 企业微信签名验证使用 Encrypt 字段的值
+    if (!encryptedValue) {
+      getWeComLogger(runtime).warn("WeCom: webhookToken configured but no Encrypt field found for signature verification");
+      res.statusCode = 400;
+      res.end("encrypted message required");
+      return true;
     }
 
     const isValid = verifyWeComSignature({
       token: selectedTarget.account.webhookToken,
       timestamp,
       nonce,
-      encryptedMsg,
+      encryptedMsg: encryptedValue,
       signature: msgSignature,
     });
 
@@ -721,19 +744,6 @@ export async function handleWeComWebhookRequest(
       res.statusCode = 401;
       res.end("unauthorized");
       return true;
-    }
-  }
-
-  // 企业微信 webhook 消息格式
-  // 如果配置了 encodingAESKey，需要解密消息
-  let encryptedValue: string | undefined;
-  if (typeof payload.Encrypt === "string") {
-    encryptedValue = payload.Encrypt;
-  } else if (rawBody && rawBody.trim().startsWith("<")) {
-    // XML 格式，从原始 XML 中提取 Encrypt 标签
-    const encryptMatch = rawBody.match(/<Encrypt><!\[CDATA\[(.*?)\]\]><\/Encrypt>|<Encrypt>(.*?)<\/Encrypt>/);
-    if (encryptMatch) {
-      encryptedValue = encryptMatch[1] || encryptMatch[2] || undefined;
     }
   }
 
@@ -746,6 +756,7 @@ export async function handleWeComWebhookRequest(
     }
     
     const logger = getWeComLogger(runtime);
+    logger.debug?.(`WeCom: attempting decryption with encodingAESKey length=${selectedTarget.account.encodingAESKey.length}, corpId=${selectedTarget.account.corpId || "not provided"}`);
     const decryptedMsg = decryptWeComMessage(
       encryptedValue,
       selectedTarget.account.encodingAESKey,
@@ -763,8 +774,19 @@ export async function handleWeComWebhookRequest(
     try {
       // 尝试解析为 XML（企业微信通常使用 XML）
       if (decryptedMsg.trim().startsWith("<")) {
-        const xmlPayload = parseWeComXML(decryptedMsg);
+        let xmlPayload = parseWeComXML(decryptedMsg);
         if (xmlPayload) {
+          // 若只解析出外层 <xml>，内层是字符串，则再解析一层（企业微信格式为 <xml><MsgType>...</MsgType>...</xml>）
+          const onlyXmlKey =
+            Object.keys(xmlPayload).length === 1 &&
+            Object.prototype.hasOwnProperty.call(xmlPayload, "xml") &&
+            typeof xmlPayload.xml === "string";
+          if (onlyXmlKey && (xmlPayload.xml as string).trim().startsWith("<")) {
+            const inner = parseWeComXML(xmlPayload.xml as string);
+            if (inner && Object.keys(inner).length > 0) {
+              xmlPayload = inner;
+            }
+          }
           payload = xmlPayload;
         } else {
           getWeComLogger(runtime).error("WeCom XML parse failed after decryption");
@@ -788,12 +810,39 @@ export async function handleWeComWebhookRequest(
   
   // 处理消息
   selectedTarget.statusSink?.({ lastInboundAt: Date.now() });
-  
-  // 解析企业微信消息
-  const msgType = typeof payload.MsgType === "string" ? payload.MsgType : "";
-  getWeComLogger(runtime).info(`[wecom] Processing message: msgType=${msgType}, FromUserName=${payload.FromUserName}, Content=${typeof payload.Content === "string" ? payload.Content.substring(0, 50) : "N/A"}`);
-  
-  if (msgType === "text") {
+
+  // 兼容 XML（PascalCase）、JSON（camelCase）及全小写键名
+  const raw = payload as Record<string, unknown>;
+  const msgType =
+    (typeof payload.MsgType === "string" ? payload.MsgType : "") ||
+    (typeof raw.msgType === "string" ? raw.msgType : "") ||
+    (typeof raw.MsgType === "string" ? raw.MsgType : "");
+  const fromUserName =
+    (typeof payload.FromUserName === "string" ? payload.FromUserName : "") ||
+    (typeof raw.fromUserName === "string" ? raw.fromUserName : "") ||
+    (typeof raw.FromUserName === "string" ? raw.FromUserName : "");
+  const contentStr =
+    (typeof payload.Content === "string" ? payload.Content : "") ||
+    (typeof raw.content === "string" ? raw.content : "") ||
+    (typeof raw.Content === "string" ? raw.Content : "");
+  // 全小写键名（部分接口返回）
+  const msgTypeLow = typeof raw.msgtype === "string" ? raw.msgtype : "";
+  const fromLow = typeof raw.fromusername === "string" ? raw.fromusername : "";
+  const contentLow = typeof raw.content === "string" ? raw.content : "";
+  const finalMsgType = msgType || msgTypeLow;
+  const finalFrom = fromUserName || fromLow;
+  const finalContent = contentStr || contentLow;
+  if (finalMsgType && !payload.FromUserName && finalFrom) raw.FromUserName = finalFrom;
+  if (finalContent && typeof payload.Content !== "string") raw.Content = finalContent;
+  if (finalMsgType && !payload.MsgType) raw.MsgType = finalMsgType;
+
+  const contentPreview = String(finalContent || (typeof payload.Content === "string" ? payload.Content : "") || "").substring(0, 50) || "N/A";
+  getWeComLogger(runtime).info(`[wecom] Processing message: msgType=${finalMsgType}, FromUserName=${finalFrom || payload.FromUserName}, Content=${contentPreview}`);
+  if (!finalMsgType) {
+    getWeComLogger(runtime).debug?.(`[wecom] decrypted payload keys: ${Object.keys(payload).join(", ")}`);
+  }
+
+  if (finalMsgType === "text") {
     processWeComMessage({
       payload,
       target: selectedTarget,
@@ -803,7 +852,7 @@ export async function handleWeComWebhookRequest(
       );
     });
   } else {
-    getWeComLogger(runtime).info(`[wecom] webhook received unsupported msgType: ${msgType}`);
+    getWeComLogger(runtime).info(`[wecom] webhook received unsupported msgType: ${finalMsgType}`);
   }
 
   res.statusCode = 200;
